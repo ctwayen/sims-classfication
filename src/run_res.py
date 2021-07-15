@@ -3,7 +3,6 @@ import matplotlib.pyplot as plt
 import pandas as pd
 import cv2
 import os
-import volo
 import torch
 import torch.nn as nn
 import torch.optim as opt
@@ -13,6 +12,8 @@ import torchvision
 import torchvision.transforms as transforms
 from torch.utils.tensorboard import SummaryWriter
 from tqdm.notebook import tqdm
+from res import wide_resnet101_2
+print(torch.__version__)
 
 study_label = pd.read_csv('../archive/train_study_level.csv')
 paths = []
@@ -22,27 +23,25 @@ for i in range(len(ids)):
     paths.append('../archive/study/{x}.png'.format(x = ids[i]))
 paths = np.array(paths)
 
-class adding_bn(nn.Module):
-    def __init__(self, n):
-        super(adding_bn, self).__init__()
-        self.bn = nn.BatchNorm2d(n)
-        kwargs = { 
-            'img_size': 224,
-            'in_chans': 1,
-            'num_classes': 4,
-            'return_dense': False,
-            'mix_token': False,
-            'drop_rate' : 0.3, 
-            'attn_drop_rate' : 0.3, 
-            'drop_path_rate' : 0.3,
-        }
-        self.model = volo.volo_d1(**kwargs)
-        
-    def forward(self, x):
-        x = self.bn(x)
-        return self.model(x)
+class ResNet(nn.Module):
+    """Model modified.
+    The architecture of our model is the same as standard DenseNet121
+    except the classifier layer which has an additional sigmoid function.
+    """
+    def __init__(self, out_size):
+        super(ResNet, self).__init__()
+        self.res = wide_resnet101_2(pretrained=False)
+        num_ftrs = self.res.fc.in_features
+        self.res.fc = nn.Sequential(
+            nn.Linear(num_ftrs, out_size),
+            nn.Sigmoid()
+        )
 
-model = adding_bn(1)
+    def forward(self, x):
+        x = self.res(x)
+        return x
+    
+model = ResNet(4)
 class classification(nn.Module):
     def __init__(self, paths, labels, aug=False):
         self.paths = paths
@@ -53,10 +52,10 @@ class classification(nn.Module):
     def __getitem__(self, idx):
             path = self.paths[idx]
             img = cv2.imread(path)[:, :, 0]
-            
-            img = cv2.resize(img, (224, 224))
             img = (img - np.mean(img))/np.std(img)
-            x = torch.from_numpy(np.array(img)).view((1, 224, 224))
+            #img = img/np.mean(img)
+            img = cv2.resize(img, (422, 422))
+            x = torch.from_numpy(np.array(img)).view((1, 422, 422))
             x = x.float()
             y = np.argmax(self.labels[idx])
             y = torch.tensor(y)
@@ -67,16 +66,15 @@ class classification(nn.Module):
     
     def get(self):
         return self.example
-    
+
 dataset = classification(paths, labels)
 print(len(dataset))
 train_set, val_set = torch.utils.data.random_split(dataset, [5000, 1054])
-
 class Trainer():
     def __init__(self,model,train_set,test_set,opts):
         self.model = model  # neural net
         # device agnostic code snippet
-        self.device = torch.device("cuda:2" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
         print(self.device)
         self.model.to(self.device)
         
@@ -89,7 +87,7 @@ class Trainer():
         self.test_loader = torch.utils.data.DataLoader(dataset=test_set,
                                                        batch_size=opts['batch_size'],
                                                        shuffle=False)
-        self.tb = SummaryWriter()
+        self.tb = SummaryWriter(log_dir='./resruns')
         self.best_loss = 1e10
         
     def train(self):
@@ -134,10 +132,11 @@ class Trainer():
             self.tb.add_scalar("Val Loss", np.mean(self.test_loss), epoch)
             if np.mean(self.test_loss) < self.best_loss:
                 self.best_loss = np.mean(self.test_loss)
-                torch.save(self.model.state_dict(), './model_weights/best1.pt')
+                torch.save(self.model.state_dict(), './model_weights/resbest.pt')
+                
 opts = {
-    'lr': 1e-5,
-    'epochs': 100,
+    'lr': 1e-4,
+    'epochs': 80,
     'batch_size': 32
 }
 train = Trainer(model, train_set, val_set, opts)

@@ -43,7 +43,7 @@ for index, row in study_label.iterrows():
             labels.append(3)
     else:
         print(name)
-
+        
 np.random.seed(seed=42)
 train_idx = np.random.choice(np.arange(6054), size=5000, replace=False)
 train_path = np.array(paths)[train_idx]
@@ -75,6 +75,7 @@ train_label = np.concatenate(
 train_idx = np.random.choice(np.arange(8363), size=8363, replace=False)
 train_path = train_path[train_idx]
 train_label = train_label[train_idx]
+
 
 class Net(nn.Module):
     def __init__(self, out_size, model):
@@ -160,12 +161,12 @@ class classification(nn.Module):
     
     def get(self):
         return self.example
-    
+
 class Trainer():
     def __init__(self,model,train_set,test_set,opts):
         self.model = model  # neural net
         # device agnostic code snippet
-        self.device = torch.device("cuda:4" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda:5" if torch.cuda.is_available() else "cpu")
         print(self.device)
         self.model.to(self.device)
     
@@ -191,7 +192,7 @@ class Trainer():
         self.test_loader = torch.utils.data.DataLoader(dataset=test_set,
                                                        batch_size=opts['batch_size'],
                                                        shuffle=False)
-        self.tb = SummaryWriter(log_dir='./runs/res')
+        self.tb = SummaryWriter(log_dir='./runs/volo')
         self.best_loss = 1e10
         self.tr_loss = []
         
@@ -214,7 +215,7 @@ class Trainer():
                     loss.backward()                        
                     self.optimizer.step()                  
                     self.tr_loss.append(loss.item()) 
-            self.tb.add_scalar("Train Loss", np.mean(self.tr_loss), epoch)
+            #self.tb.add_scalar("Train Loss", np.mean(self.tr_loss), epoch)
             self.test(epoch) # run through the validation set
         self.tb.close()
             
@@ -245,10 +246,10 @@ class Trainer():
             self.tb.add_scalar("Val Loss", np.mean(self.test_loss), epoch)
             if np.mean(self.test_loss) < self.best_loss:
                 self.best_loss = np.mean(self.test_loss)
-                torch.save(self.model.state_dict(), './model_weights/resbest.pt')
-train_set = classification(train_path, train_label, size=(512, 512), train=True)
-val_set = classification(test_path, train_label, size=(512, 512), train=False)
-model = Net(4, 'res')
+                torch.save(self.model.state_dict(), './model_weights/volobest.pt')
+train_set = classification(train_path, train_label, size=(422, 422), train=True)
+val_set = classification(test_path, train_label, size=(422, 422), train=False)
+model = Net(4, 'volo')
 #model.load_state_dict(torch.load('./model_weights/inception_init.pt'))
 opts = {
     'lr': 1e-4,
