@@ -21,30 +21,47 @@ import torch
 import timm
 import torch.nn as nn
 import torch.nn.functional as F
+import torchvision.transforms as T
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import Dataset, DataLoader
+from focal import FocalLoss
 
 import warnings
 warnings.simplefilter('ignore')
 
 class config:
     model_name = 'tf_efficientnet_b5'
-    image_size = (500, 500)
+    image_size = (512, 512)
     TRAIN_BS = 16
     VALID_BS = 16
     EPOCHS = 20
+    loss = 'focal'
     
 paths = ['../output/' + x for x in os.listdir('../output')]
-np.random.seed(seed=0)
-train_idx = np.random.choice(np.arange(6054), size=5100, replace=False)
+np.random.seed(seed=2)
+train_idx = np.random.choice(np.arange(6054), size=5200, replace=False)
 train_path = np.array(paths)[train_idx]
 test_path = np.array(paths)[[x for x in np.arange(6054) if x not in train_idx]]
 
+for path in train_path:
+    data = h5py.File(path, 'r')
+    if np.argmax(data['label'][:]) == 3:
+        train_path = np.append(train_path, path)
+
+trans = T.RandomApply(torch.nn.ModuleList([
+                T.RandomAffine(
+                    degrees = (10, 30),
+                    translate = (0.2, 0.2),
+                ),
+                T.RandomRotation(degrees=(0, 50)),
+                T.RandomHorizontalFlip(p=0.5)  
+            ]),p = 0.8)
+
 class SIIMData(Dataset):
-    def __init__(self, paths, is_train=True, img_size=config.image_size):
+    def __init__(self, paths, is_aug=False, img_size=config.image_size):
         super().__init__()
         self.paths = paths
-        self.is_train = is_train
+        self.is_aug = is_aug
         self.img_size = img_size
         
     def __getitem__(self, idx):
@@ -56,6 +73,8 @@ class SIIMData(Dataset):
         image = torch.tensor(image).view(self.img_size[0], self.img_size[1], 1)
         
         label = np.argmax(data['label'][:]).astype(int)
+        if self.is_aug:
+            return trans(image), torch.tensor(label)
         return image, torch.tensor(label)
     
     def __len__(self):
@@ -69,19 +88,6 @@ class EfficientNetModel(nn.Module):
         super(EfficientNetModel, self).__init__()
         self.model = timm.create_model(model_name, pretrained=pretrained, in_chans=1)
         self.model.classifier = nn.Linear(self.model.classifier.in_features, num_classes)
-        
-    def forward(self, x):
-        x = self.model(x)
-        return x
-
-class NFNetModel(nn.Module):
-    """
-    Model Class for EfficientNet Model
-    """
-    def __init__(self, num_classes=4, model_name=config.model_name, pretrained=True):
-        super(NFNetModel, self).__init__()
-        self.model = timm.create_model(model_name, pretrained=pretrained, in_chans=3)
-        self.model.head.fc = nn.Linear(self.model.head.fc.in_features, num_classes)
         
     def forward(self, x):
         x = self.model(x)
@@ -109,10 +115,13 @@ class Trainer:
         self.model = model.to(self.device)
         self.scaler = GradScaler()
         self.optim = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.001)
-        self.loss = torch.nn.CrossEntropyLoss()
+        if config.loss == 'ce':
+            self.loss = torch.nn.CrossEntropyLoss()
+        elif config.loss == 'focal':
+            self.loss = FocalLoss(**{"alpha": 0.5, "gamma": 2.0, "reduction": 'mean'})
         self.epoch = epoch
         self.best_loss = 1e10
-        self.tb = SummaryWriter(log_dir='./runs/efbn')
+        self.tb = SummaryWriter(log_dir='./runs/efbn2')
         
     
     def train_one_cycle(self):
@@ -224,11 +233,12 @@ class Trainer:
             self.tb.add_scalar("Train Loss", train, i)
             test, model, acc, auc = self.valid_one_cycle()
             self.tb.add_scalar("Val Acc", acc, i)
-            self.tb.add_scalar("Val Auc", auc, i)
+            self.tb.add_scalar("Val Loss", auc, i)
             self.tb.add_scalar("Val Loss", test, i)
             if test < self.best_loss:
                 self.best_loss = test
-                torch.save(self.model.state_dict(), './model_weights/efbnbest.pt')
+                torch.save(self.model.state_dict(), './model_weights/efbnbest2.pt')
+
 training_set = SIIMData(train_path)
 validation_set = SIIMData(test_path)
 train_loader = DataLoader(

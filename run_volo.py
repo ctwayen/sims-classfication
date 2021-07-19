@@ -1,6 +1,6 @@
 import sys
 sys.path.append("../input/timmeffnetv2")
-
+from torch.utils.tensorboard import SummaryWriter
 import platform
 import numpy as np
 import pandas as pd
@@ -16,7 +16,6 @@ from pydicom.pixel_data_handlers.util import apply_voi_lut
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
-from torch.utils.tensorboard import SummaryWriter
 import torch
 import timm
 import torch.nn as nn
@@ -24,19 +23,22 @@ import torch.nn.functional as F
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import Dataset, DataLoader
 
+from src.volo import volo_d1
+
 import warnings
 warnings.simplefilter('ignore')
 
 class config:
     model_name = 'tf_efficientnet_b5'
-    image_size = (500, 500)
-    TRAIN_BS = 16
-    VALID_BS = 16
+    image_size = (488, 488)
+    TRAIN_BS = 12
+    VALID_BS = 12
     EPOCHS = 20
     
+    
 paths = ['../output/' + x for x in os.listdir('../output')]
-np.random.seed(seed=0)
-train_idx = np.random.choice(np.arange(6054), size=5100, replace=False)
+np.random.seed(seed=2)
+train_idx = np.random.choice(np.arange(6054), size=5200, replace=False)
 train_path = np.array(paths)[train_idx]
 test_path = np.array(paths)[[x for x in np.arange(6054) if x not in train_idx]]
 
@@ -61,28 +63,39 @@ class SIIMData(Dataset):
     def __len__(self):
         return len(self.paths)
     
-class EfficientNetModel(nn.Module):
-    """
-    Model Class for EfficientNet Model
-    """
-    def __init__(self, num_classes=4, model_name=config.model_name, pretrained=True):
-        super(EfficientNetModel, self).__init__()
-        self.model = timm.create_model(model_name, pretrained=pretrained, in_chans=1)
-        self.model.classifier = nn.Linear(self.model.classifier.in_features, num_classes)
-        
-    def forward(self, x):
-        x = self.model(x)
-        return x
-
-class NFNetModel(nn.Module):
-    """
-    Model Class for EfficientNet Model
-    """
-    def __init__(self, num_classes=4, model_name=config.model_name, pretrained=True):
-        super(NFNetModel, self).__init__()
-        self.model = timm.create_model(model_name, pretrained=pretrained, in_chans=3)
-        self.model.head.fc = nn.Linear(self.model.head.fc.in_features, num_classes)
-        
+class Net(nn.Module):
+    def __init__(self, out_size, model):
+        super(Net, self).__init__()
+        if model == 'dense':
+            self.model = torchvision.models.densenet121(pretrained=True, **{'drop_rate' : 0.3})
+            num_ftrs = self.model.classifier.in_features
+            self.model.classifier = nn.Sequential(
+                nn.Linear(num_ftrs, out_size)
+            )
+            
+        elif model == 'res':
+            self.model = torchvision.models.wide_resnet101_2(pretrained=True)
+            num_ftrs = self.model.fc.in_features
+            self.model.fc = nn.Sequential(
+                nn.Linear(num_ftrs, out_size)
+            )
+        elif model == 'inception':
+            self.model = torchvision.models.inception_v3(pretrained=True, **{"aux_logits": False})
+            num_ftrs = self.model.fc.in_features
+            self.model.fc = nn.Sequential(
+                nn.Linear(num_ftrs, out_size)
+            )
+        else:
+            kwargs = { 
+            'img_size': 488,
+            'in_chans': 1,
+            'num_classes': 4,
+            'return_dense': False,
+            'mix_token': False,
+            'patch_size': 8,
+            'drop_rate' : 0.2
+        }
+            self.model = volo_d1(**kwargs)
     def forward(self, x):
         x = self.model(x)
         return x
@@ -104,7 +117,7 @@ class Trainer:
         self.valid = valid_dataloader
         self.agc = agc
         
-        self.device = torch.device("cuda:0" if torch.cuda.is_available() else "cpu")
+        self.device = torch.device("cuda:1" if torch.cuda.is_available() else "cpu")
         print(self.device)
         self.model = model.to(self.device)
         self.scaler = GradScaler()
@@ -112,7 +125,7 @@ class Trainer:
         self.loss = torch.nn.CrossEntropyLoss()
         self.epoch = epoch
         self.best_loss = 1e10
-        self.tb = SummaryWriter(log_dir='./runs/efbn')
+        self.tb = SummaryWriter(log_dir='./runs/volo')
         
     
     def train_one_cycle(self):
@@ -228,7 +241,7 @@ class Trainer:
             self.tb.add_scalar("Val Loss", test, i)
             if test < self.best_loss:
                 self.best_loss = test
-                torch.save(self.model.state_dict(), './model_weights/efbnbest.pt')
+                torch.save(self.model.state_dict(), './model_weights/volobest.pt')
 training_set = SIIMData(train_path)
 validation_set = SIIMData(test_path)
 train_loader = DataLoader(
@@ -243,6 +256,7 @@ valid_loader = DataLoader(
     shuffle=False
 )
 
-model = EfficientNetModel()
+model = Net(4, 'volo')
 train = Trainer(train_loader, valid_loader, model)
 train.train_epoch()
+
