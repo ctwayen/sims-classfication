@@ -1,6 +1,6 @@
 import sys
-sys.path.append("../input/timmeffnetv2")
 
+from torch.utils.tensorboard import SummaryWriter
 import platform
 import numpy as np
 import pandas as pd
@@ -16,7 +16,6 @@ from pydicom.pixel_data_handlers.util import apply_voi_lut
 from sklearn.metrics import roc_auc_score
 from sklearn.model_selection import StratifiedKFold
 
-from torch.utils.tensorboard import SummaryWriter
 import torch
 import timm
 import torch.nn as nn
@@ -24,22 +23,24 @@ import torch.nn.functional as F
 import torchvision.transforms as T
 from torch.cuda.amp import GradScaler, autocast
 from torch.utils.data import Dataset, DataLoader
+
+from src.volo import volo_d1
 from focal import FocalLoss
 
 import warnings
 warnings.simplefilter('ignore')
 
 class config:
-    model_name = 'tf_efficientnet_b5'
+    model_name = 'tf_efficientnet_b7'
     image_size = (512, 512)
-    TRAIN_BS = 16
+    TRAIN_BS = 12
     VALID_BS = 16
     EPOCHS = 20
-    loss = 'focal'
+    loss = 'bce'
     
 paths = ['../output/' + x for x in os.listdir('../output')]
-np.random.seed(seed=2)
-train_idx = np.random.choice(np.arange(6054), size=5200, replace=False)
+np.random.seed(seed=0)
+train_idx = np.random.choice(np.arange(6054), size=4800, replace=False)
 train_path = np.array(paths)[train_idx]
 test_path = np.array(paths)[[x for x in np.arange(6054) if x not in train_idx]]
 
@@ -53,7 +54,6 @@ trans = T.RandomApply(torch.nn.ModuleList([
                     degrees = (10, 30),
                     translate = (0.2, 0.2),
                 ),
-                T.RandomRotation(degrees=(0, 50)),
                 T.RandomHorizontalFlip(p=0.5)  
             ]),p = 0.8)
 
@@ -71,7 +71,6 @@ class SIIMData(Dataset):
         image = cv2.resize(image, self.img_size)
         image = image/255
         image = torch.tensor(image).view(self.img_size[0], self.img_size[1], 1)
-        
         label = np.argmax(data['label'][:]).astype(int)
         if self.is_aug:
             return trans(image), torch.tensor(label)
@@ -92,7 +91,7 @@ class EfficientNetModel(nn.Module):
     def forward(self, x):
         x = self.model(x)
         return x
-    
+
 def roc_auc_compute_fn(y_preds, y_targets) -> float:
     return roc_auc_score(y_targets, y_preds, average='weighted', multi_class='ovo')
 
@@ -100,6 +99,24 @@ def one_hot(a):
     b = np.zeros((a.size, 4))
     b[np.arange(a.size),a] = 1
     return b
+
+def one_hot_tensor(labels: torch.Tensor, num_classes: int, dtype: torch.dtype = torch.float, dim: int = 1) -> torch.Tensor:
+    # if `dim` is bigger, add singleton dim at the end
+    if labels.ndim < dim + 1:
+        shape = list(labels.shape) + [1] * (dim + 1 - len(labels.shape))
+        labels = torch.reshape(labels, shape)
+
+    sh = list(labels.shape)
+
+    if sh[dim] != 1:
+        raise AssertionError("labels should have a channel with length equal to one.")
+
+    sh[dim] = num_classes
+
+    o = torch.zeros(size=sh, dtype=dtype, device=labels.device)
+    labels = o.scatter_(dim=dim, index=labels.long(), value=1)
+
+    return labels
 
 class Trainer:
     def __init__(self, train_dataloader, valid_dataloader, model, epoch = config.EPOCHS, agc=False):
@@ -114,14 +131,16 @@ class Trainer:
         print(self.device)
         self.model = model.to(self.device)
         self.scaler = GradScaler()
-        self.optim = torch.optim.AdamW(model.parameters(), lr=1e-4, weight_decay=0.001)
+        self.optim = torch.optim.AdamW(model.parameters(), lr=1e-5, weight_decay=0.001)
         if config.loss == 'ce':
             self.loss = torch.nn.CrossEntropyLoss()
         elif config.loss == 'focal':
             self.loss = FocalLoss(**{"alpha": 0.5, "gamma": 2.0, "reduction": 'mean'})
+        elif config.loss == 'bce':
+            self.loss = nn.BCEWithLogitsLoss()
         self.epoch = epoch
-        self.best_loss = 1e10
-        self.tb = SummaryWriter(log_dir='./runs/efbn2')
+        self.best_auc = 0
+        self.tb = SummaryWriter(log_dir='./runs/efbn_bce_b7')
         
     
     def train_one_cycle(self):
@@ -142,7 +161,10 @@ class Trainer:
             xtrain = xtrain.permute(0, 3, 1, 2)
             with autocast():
                 z = self.model(xtrain)
-                train_loss = self.loss(z, ytrain)
+                if config.loss == 'bce':
+                    train_loss = self.loss(z, one_hot_tensor(ytrain, 4))
+                else:
+                    train_loss = self.loss(z, ytrain)
                 self.scaler.scale(train_loss).backward()
                 if self.agc:
                     adaptive_clip_grad(self.model.parameters(), clip_factor=0.01, eps=1e-3, norm_type=2.0)
@@ -194,7 +216,10 @@ class Trainer:
                 
                 val_z = self.model(xval)
                 
-                val_loss = self.loss(val_z, yval)
+                if config.loss == 'bce':
+                    val_loss = self.loss(val_z, one_hot_tensor(yval, 4))
+                else:
+                    val_loss = self.loss(val_z, yval)
                 
                 running_loss += val_loss.item()
                 
@@ -235,11 +260,12 @@ class Trainer:
             self.tb.add_scalar("Val Acc", acc, i)
             self.tb.add_scalar("Val Loss", auc, i)
             self.tb.add_scalar("Val Loss", test, i)
-            if test < self.best_loss:
-                self.best_loss = test
-                torch.save(self.model.state_dict(), './model_weights/efbnbest2.pt')
-
-training_set = SIIMData(train_path)
+            if auc > self.best_auc:
+                self.best_auc = auc
+                print(auc)
+                torch.save(self.model.state_dict(), './model_weights/efbn_bce_b7.pt')
+                
+training_set = SIIMData(train_path, is_aug=True)
 validation_set = SIIMData(test_path)
 train_loader = DataLoader(
     training_set,
@@ -252,7 +278,6 @@ valid_loader = DataLoader(
     batch_size=config.VALID_BS,
     shuffle=False
 )
-
 model = EfficientNetModel()
 train = Trainer(train_loader, valid_loader, model)
 train.train_epoch()
